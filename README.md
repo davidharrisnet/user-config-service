@@ -1,1 +1,171 @@
 # user-config-service
+
+A Spring Boot REST service that stores per-user display settings: a result size, a font
+size, and each user's personal ordering of a shared fruit list. Data is kept in a local
+SQLite file.
+
+## Requirements
+
+- JDK 21
+- `make` (optional; every target wraps a `./gradlew` command)
+
+The Gradle project lives in [`user-config-service/`](user-config-service/). The Makefile at
+the repo root runs Gradle there, so `make` commands work from the top level.
+
+## Quick start
+
+```bash
+make run
+```
+
+Then open the Swagger UI at **http://localhost:8080/swagger-ui.html** to try the endpoints
+from the browser. The OpenAPI description is at `/v3/api-docs`.
+
+The database starts empty, so create a user first (`POST /users`), then use the returned
+`user_id` with the other endpoints.
+
+## Make targets
+
+| Target | What it does |
+|---|---|
+| `make build` | Compile, test and package |
+| `make build-notest` | Compile and package, skipping tests |
+| `make test` | Run all tests |
+| `make test TEST=Class.method` | Run one test class or method, e.g. `TEST=FruitOrderControllerTests` |
+| `make run` | Start the app on port 8080 |
+| `make jar` | Build the executable jar into `user-config-service/build/libs/` |
+| `make clean` | Delete build outputs |
+| `make deps` | Show the runtime dependency tree |
+
+## API
+
+Settings endpoints are keyed by numeric user id and return the user's full settings.
+
+| Method | Path | Body |
+|---|---|---|
+| `GET` | `/users` | – (lists all users) |
+| `POST` | `/users` | `{"username": "frank", "email": "frank@example.com"}` |
+| `GET` | `/users/{userId}/settings` | – |
+| `POST` | `/users/{userId}/result_size` | `{"result_size": 35}` |
+| `POST` | `/users/{userId}/font_size` | `{"font_size": 16}` |
+| `POST` | `/users/{userId}/fruits` | `{"fruit_ids": [3, 1, 6, 2, 5, 4]}` |
+
+`GET /users` returns users ordered by id, without their settings:
+
+```json
+[
+  {"user_id": 1, "username": "frank", "email": "frank@example.com", "created_at": "2026-11-10T01:33:50.164Z"},
+  {"user_id": 2, "username": "gina", "email": "gina@example.com", "created_at": "2026-11-10T01:33:50.266Z"}
+]
+```
+
+Settings response:
+
+```json
+{
+  "user_id": 1,
+  "username": "frank",
+  "result_size": 35,
+  "font_size": 12,
+  "fruits": [
+    {"id": 3, "name": "banana"},
+    {"id": 1, "name": "apple"},
+    {"id": 6, "name": "orange"},
+    {"id": 2, "name": "pear"},
+    {"id": 5, "name": "melon"},
+    {"id": 4, "name": "strawberry"}
+  ]
+}
+```
+
+Errors are returned as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details
+(`{"status": 404, "title": "Not Found", "detail": "No user with id 42", ...}`):
+
+| Status | When |
+|---|---|
+| `400` | Missing or invalid input: blank username or email, a size below 1, empty, duplicate or unknown fruit ids |
+| `404` | No user with that id |
+| `409` | Username or email already taken, or the submitted fruit list doesn't match the current active fruits |
+
+## Settings rules
+
+- A new user gets default settings: `result_size` 20, `font_size` 12, and every active fruit
+  in id order.
+- No value in the database can be null.
+- Sizes must be whole numbers of 1 or more.
+
+### Fruit list
+
+There is **one fruit list shared by all users**; each user only stores their own order of it.
+The fruits are seeded from
+[`data.sql`](user-config-service/src/main/resources/data.sql):
+
+| id | name |
+|---|---|
+| 1 | apple |
+| 2 | pear |
+| 3 | banana |
+| 4 | strawberry |
+| 5 | melon |
+| 6 | orange |
+
+`POST /users/{userId}/fruits` must contain **every active fruit exactly once**. If the list
+doesn't match, for example because a fruit was added or retired after the page loaded, the
+service returns `409` and the client should reload the settings and try again.
+
+Managing fruits:
+
+| Change | How | Effect on users |
+|---|---|---|
+| Add | Add a row with a **new** id to `data.sql` | New users get it; existing users see it at the end of their list |
+| Retire | `UPDATE fruit SET active = 0 WHERE id = ?` | Hidden from everyone; saved orders are kept |
+| Bring back | `UPDATE fruit SET active = 1 WHERE id = ?` | Reappears where each user had it |
+
+Never delete a fruit row or reuse an id. Saved orders, and pages that hold fruit ids, rely on
+an id always meaning the same fruit.
+
+## Data model
+
+```
+user (id, username, email, created_at)
+  └── user_settings (id, user_id, results_size, font_size)        one per user
+        └── user_settings_fruit (user_settings_id, position, fruit_id)
+                                                     └── fruit (id, name, active)
+```
+
+`user_settings_fruit.position` is the 0-based place of each fruit in the user's order.
+
+## Configuration and database
+
+Settings are in
+[`application.properties`](user-config-service/src/main/resources/application.properties).
+The database is the SQLite file `user-config.db`, created in the directory the app is started
+from (it's gitignored).
+
+The schema is defined in
+[`schema.sql`](user-config-service/src/main/resources/schema.sql) and runs at every startup,
+not generated by Hibernate. SQLite can't add constraints to existing tables, so Hibernate's
+generated schema would silently drop the foreign keys and unique constraints. Because the
+script uses `CREATE TABLE IF NOT EXISTS`, **changing an existing table requires deleting
+`user-config.db`** (losing its data) or migrating it by hand.
+
+## Tests
+
+```bash
+make test
+```
+
+Tests use a separate database at `user-config-service/build/test.db`, and each test's data is
+rolled back. Test reports are written to
+`user-config-service/build/reports/tests/test/index.html`.
+
+## Before deploying
+
+- **There is no authentication.** Anyone who can reach the service can read or change any
+  user's settings, and sequential ids are easy to guess.
+- **Swagger UI is enabled by default.** Disable it in production with
+  `springdoc.swagger-ui.enabled=false` and `springdoc.api-docs.enabled=false`.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
